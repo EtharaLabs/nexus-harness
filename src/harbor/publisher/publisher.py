@@ -22,7 +22,7 @@ from tenacity import (
 from harbor.auth.client import reset_client
 from harbor.constants import ARCHIVE_FILENAME
 from harbor.db.client import RegistryDB
-from harbor.models.dataset.manifest import DatasetManifest
+from harbor.models.dataset.manifest import DatasetManifest, DatasetTaskRef
 from harbor.models.dataset.paths import DatasetPaths
 from harbor.models.task.config import (
     MultiStepRewardStrategy,
@@ -178,6 +178,7 @@ class Publisher:
         *,
         temporary_key: UUID | None = None,
         organization: str | None = None,
+        expected_ref: DatasetTaskRef | None = None,
     ) -> PublishResult:
         """Publish normally, or reserve a private destination with a stable key."""
         task_dir = task_dir.resolve()
@@ -199,6 +200,15 @@ class Publisher:
 
         build_start = time.monotonic()
         content_hash, files = Packager.compute_content_hash(task_dir)
+        if expected_ref is not None and (
+            config.task is None
+            or config.task.name != expected_ref.name
+            or f"sha256:{content_hash}" != expected_ref.digest
+        ):
+            raise ValueError(
+                f"Task {task_dir} changed since manifest resolution; "
+                f"expected {expected_ref.name}@{expected_ref.digest}. Rerun publish after finishing edits."
+            )
 
         if temporary_key is not None:
             reservation = await self.registry_db.reserve_temporary_task(
@@ -361,6 +371,7 @@ class Publisher:
         organization: str | None = None,
         on_task_upload_start: Callable[[Path], Any] | None = None,
         on_task_upload_complete: Callable[[Path, PublishResult], Any] | None = None,
+        expected_refs: dict[Path, DatasetTaskRef] | None = None,
     ) -> BatchPublishResult:
         """Publish a batch with bounded concurrency and input-ordered results.
 
@@ -381,12 +392,18 @@ class Publisher:
                 try:
                     if on_task_upload_start:
                         on_task_upload_start(task_dir)
+                    pin_kwargs = (
+                        {"expected_ref": expected_refs[task_dir]}
+                        if expected_refs is not None
+                        else {}
+                    )
                     result = await self.publish_task(
                         task_dir,
                         tags=tags,
                         visibility=visibility,
                         temporary_key=uuid4() if temporary else None,
                         organization=organization,
+                        **pin_kwargs,
                     )
                     results[index] = result
                     if on_task_upload_complete:
