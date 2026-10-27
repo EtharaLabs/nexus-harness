@@ -31,6 +31,7 @@ from harbor.server.models import (
     RolloutSummary,
     SubmitRequest,
 )
+from harbor.server.relay import Relay, relay_agent_config
 from harbor.server.resolution import ResolvedJob, resolve_input
 from harbor.server.store import ROLLOUT_SUMMARY_COLUMNS, Store, fingerprint, now
 from harbor.utils.logger import logger
@@ -46,6 +47,7 @@ class Service:
         *,
         max_concurrent: int = DEFAULT_MAX_CONCURRENT,
         executor: TrialExecutor | None = None,
+        relay: Relay | None = None,
     ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be positive")
@@ -53,6 +55,7 @@ class Service:
         self.files = self.data_dir / "files"
         self.max_concurrent = max_concurrent
         self.executor = executor or TrialExecutor()
+        self.relay = relay
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.entered: set[str] = set()
         self.wake = asyncio.Event()
@@ -303,15 +306,24 @@ class Service:
     async def submit(
         self, request: SubmitRequest, *, owner: str = "local"
     ) -> dict[str, Any]:
-        digest = fingerprint(
-            request.input.model_dump(mode="python", exclude_unset=True)
-        )
+        inputs = request.input.model_dump(mode="python", exclude_unset=True)
+        if request.session_id is not None:
+            inputs["session_id"] = request.session_id
+        digest = fingerprint(inputs)
         previous = self.store.deduplicated(
             "submit_job", request.request_id, digest, owner=owner
         )
         if previous is not None:
             return previous
         resolved: ResolvedJob = await resolve_input(request.input)
+        relayed = any(config.agent.relay_inference for config in resolved.trials)
+        if relayed and self.relay is None:
+            raise ProtocolError(
+                "unsupported_capability",
+                "Configure --relay-url to enable inference relay.",
+            )
+        if request.session_id is not None and not relayed:
+            raise ProtocolError("invalid_input", "session_id requires relay_inference.")
         if self.closing:
             raise ProtocolError("unavailable", "The service is shutting down.", 503)
         # Resolution can yield. Recheck deduplication inside the acceptance transaction.
@@ -327,6 +339,7 @@ class Service:
                 "jobs",
                 id=job_id,
                 owner=owner,
+                session_id=request.session_id,
                 name=resolved.config.job_name
                 if resolved.config
                 else f"job-{job_id[:8]}",
@@ -378,6 +391,8 @@ class Service:
         return self.get_rollout(rollout_id, owner=owner)
 
     def _interrupt(self, rollout_id: str) -> None:
+        if self.relay is not None:
+            self.relay.revoke(rollout_id)
         task = self.tasks.get(rollout_id)
         # A not-yet-entered coroutine checks persisted cancellation before doing work.
         if task is not None and rollout_id in self.entered and not task.cancelling():
@@ -405,6 +420,7 @@ class Service:
             self.store.refresh_job(row["job_id"])
         if not soft:
             self._interrupt(str(rollout_id))
+        self._finish_relay_job(row["job_id"])
         self.wake.set()
         return self.get_rollout(rollout_id, owner=owner)
 
@@ -427,6 +443,7 @@ class Service:
         if mode == "hard":
             for row in rows:
                 self._interrupt(row["id"])
+        self._finish_relay_job(str(job_id))
         self.wake.set()
         return self.get_job(job_id, owner=owner)
 
@@ -533,17 +550,33 @@ class Service:
         try:
             if self.closing or row["cancel_mode"] == "hard":
                 raise asyncio.CancelledError()
+            config = TrialConfig.model_validate_json(row["config"])
+            agent_config = None
+            if config.agent.relay_inference:
+                if self.relay is None:
+                    raise ValueError("Inference relay is not configured.")
+                job = self.store.row("jobs", row["job_id"])
+                token = self.relay.register(
+                    job["owner"], row["job_id"], rollout_id, job["session_id"]
+                )
+                agent_config = relay_agent_config(
+                    config.agent, self.relay.base_url, token
+                )
             result = await self.executor.run(
                 UUID(rollout_id),
-                TrialConfig.model_validate_json(row["config"]),
+                config,
                 TrialLock.model_validate_json(row["lock"]),
                 checkpoint,
+                agent_config=agent_config,
             )
         except asyncio.CancelledError as exc:
             result = self._failure(self.store.row("rollouts", rollout_id), exc)
         except Exception as exc:  # noqa: BLE001 -- Persist executor failures without stopping other jobs.
             logger.debug("Rollout execution failed", exc_info=True)
             result = self._failure(self.store.row("rollouts", rollout_id), exc)
+        finally:
+            if self.relay is not None:
+                self.relay.revoke(rollout_id)
         try:
             row = self.store.row("rollouts", rollout_id)
             cancelled = row["cancel_mode"] == "hard" or (
@@ -563,10 +596,17 @@ class Service:
                 )
                 self._auto_retry(row, result)
                 self.store.refresh_job(row["job_id"])
+            self._finish_relay_job(row["job_id"])
         finally:
             self.tasks.pop(rollout_id, None)
             self.entered.discard(rollout_id)
             self.wake.set()
+
+    def _finish_relay_job(self, job_id: str) -> None:
+        if self.relay is not None:
+            job = self.store.row("jobs", job_id, columns="owner, state")
+            if job["state"] in TERMINAL:
+                self.relay.finish_job(job["owner"], job_id)
 
     async def _schedule(self) -> None:
         while not self.closing:

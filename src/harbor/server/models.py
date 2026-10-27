@@ -127,6 +127,9 @@ class JobInput(BaseModel):
 
 class SubmitRequest(Request):
     request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    session_id: str | None = Field(
+        default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_-]+$"
+    )
     input: JobInput
 
 
